@@ -1,5 +1,10 @@
+import logging
+
+nb_logger = logging.getLogger("numba")
+nb_logger.setLevel(logging.ERROR)  # only show error
 import torch
 from torch.nn import ParameterDict, Parameter
+from torch.utils.data import DataLoader, TensorDataset
 import wandb
 from tqdm import tqdm
 import hydra
@@ -11,6 +16,7 @@ import yaml
 from torchaudio import load
 from torchaudio.functional import lfilter
 from torchcomp import ms2coef, coef2ms, db2amp
+from torchlpc import sample_wise_lpc
 import pyloudnorm as pyln
 
 from utils import (
@@ -20,7 +26,16 @@ from utils import (
     freq_simple_compressor,
     esr,
     SPSACompressor,
+    chain_functions,
+    logits2comp_params,
 )
+
+
+def simple_filter(x: torch.Tensor, a1: torch.Tensor, b1: torch.Tensor) -> torch.Tensor:
+    return sample_wise_lpc(
+        x + b1 * torch.cat([x.new_zeros(x.shape[0], 1), x[:, :-1]], dim=1),
+        a1.broadcast_to(x.shape + (1,)),
+    )
 
 
 @hydra.main(config_path="cfg", config_name="config")
@@ -28,6 +43,10 @@ def train(cfg: DictConfig):
     # TODO: Add a proper logger
 
     tr_cfg = cfg.data.train
+    duration = cfg.data.duration
+    overlap = cfg.data.overlap
+    batch_size = cfg.data.batch_size
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_input, sr = load(tr_cfg.input)
     train_target, sr2 = load(tr_cfg.target)
@@ -38,66 +57,44 @@ def train(cfg: DictConfig):
 
     assert train_input.shape == train_target.shape, "Input and target shapes must match"
 
+    frame_size = int(sr * duration)
+    hop_size = frame_size - int(sr * overlap)
+
     meter = pyln.Meter(sr)
     loudness = meter.integrated_loudness(train_input.numpy().T)
     print(f"Train input loudness: {loudness}")
-
-    if "test" in cfg.data:
-        test_cfg = cfg.data.test
-        test_input, sr3 = load(test_cfg.input)
-        assert sr == sr3, "Sample rates must match"
-        test_target, sr4 = load(test_cfg.target)
-        assert sr == sr4, "Sample rates must match"
-        assert (
-            test_input.shape == test_target.shape
-        ), "Input and target shapes must match"
-        if test_cfg.start is not None and test_cfg.end:
-            test_input = test_input[
-                :, int(sr * test_cfg.start) : int(sr * test_cfg.end)
-            ]
-            test_target = test_target[
-                :, int(sr * test_cfg.start) : int(sr * test_cfg.end)
-            ]
-
-        loudness = meter.integrated_loudness(test_input.numpy().T)
-        print(f"Test input loudness: {loudness}")
-    else:
-        test_input = test_target = None
+    target_loudness = meter.integrated_loudness(train_target.numpy().T)
+    print(f"Train target loudness: {target_loudness}")
 
     m2c = partial(ms2coef, sr=sr)
     c2m = partial(coef2ms, sr=sr)
 
-    config: Any = OmegaConf.to_container(cfg)
-    wandb_init = config.pop("wandb_init", {})
-    run: Any = wandb.init(config=config, **wandb_init)
+    # config: Any = OmegaConf.to_container(cfg)
+    # wandb_init = config.pop("wandb_init", {})
+    # run: Any = wandb.init(config=config, **wandb_init)
 
     # initialize model
     inits = cfg.compressor.inits
     init_th = torch.tensor(inits.threshold, dtype=torch.float32)
     init_ratio = torch.tensor(inits.ratio, dtype=torch.float32)
     init_at = m2c(torch.tensor(inits.attack_ms, dtype=torch.float32))
+    init_rt = m2c(torch.tensor(inits.release_ms, dtype=torch.float32))
     init_rms_avg = torch.tensor(inits.rms_avg, dtype=torch.float32)
     init_make_up_gain = torch.tensor(inits.make_up_gain, dtype=torch.float32)
 
-    param_th = Parameter(init_th)
-    param_ratio_logit = Parameter(torch.log(init_ratio - 1))
-    param_at_logit = Parameter(arcsigmoid(init_at))
-    param_rms_avg_logit = Parameter(arcsigmoid(init_rms_avg))
-    param_make_up_gain = Parameter(init_make_up_gain)
+    th = init_th
+    ratio_logit = torch.log(init_ratio - 1)
+    at_logit = arcsigmoid(init_at)
+    rt_logit = arcsigmoid(init_rt)
+    rms_avg_logit = arcsigmoid(init_rms_avg)
+    make_up_gain = init_make_up_gain
 
-    param_ratio = lambda: param_ratio_logit.exp() + 1
-    param_at = lambda: param_at_logit.sigmoid()
-    param_rms_avg = lambda: param_rms_avg_logit.sigmoid()
+    params = torch.stack(
+        [rms_avg_logit, th, ratio_logit, at_logit, rt_logit, make_up_gain]
+    ).to(device)
 
-    params = ParameterDict(
-        {
-            "threshold": param_th,
-            "ratio_logit": param_ratio_logit,
-            "at_logit": param_at_logit,
-            "rms_avg_logit": param_rms_avg_logit,
-            "make_up_gain": param_make_up_gain,
-        }
-    )
+    train_input = train_input.to(device)
+    train_target = train_target.to(device)
 
     if cfg.compressor.init_config:
         init_cfg = yaml.safe_load(open(cfg.compressor.init_config))
@@ -106,190 +103,129 @@ def train(cfg: DictConfig):
         params.load_state_dict(init_params, strict=False)
 
     comp_delay = cfg.compressor.delay
-
-    if cfg.compressor.simple:
-        runner = (
-            simple_compressor
-            if not cfg.compressor.freq_sampling
-            else freq_simple_compressor
-        )
-        infer = lambda x: runner(
-            x,
-            avg_coef=param_rms_avg(),
-            th=param_th,
-            ratio=param_ratio(),
-            at=param_at(),
-            make_up=param_make_up_gain,
-            delay=comp_delay,
-        )
-    else:
-        init_rt = m2c(torch.tensor(inits.release_ms, dtype=torch.float32))
-        param_rt_logit = Parameter(arcsigmoid(init_rt))
-        params["rt_logit"] = param_rt_logit
-        param_rt = lambda: param_rt_logit.sigmoid()
-        if cfg.compressor.spsa:
-            infer = lambda x: SPSACompressor.apply(
-                x,
-                param_rms_avg(),
-                param_th,
-                param_ratio(),
-                param_at(),
-                param_rt(),
-                param_make_up_gain,
-                comp_delay,
-            )
-        else:
-            infer = lambda x: compressor(
-                x,
-                avg_coef=param_rms_avg(),
-                th=param_th,
-                ratio=param_ratio(),
-                at=param_at(),
-                rt=param_rt(),
-                make_up=param_make_up_gain,
-                delay=comp_delay,
-            )
-
-    # initialize optimiser
-    optimiser = hydra.utils.instantiate(cfg.optimiser, params.values())
-
-    # initialize scheduler
-    scheduler = hydra.utils.instantiate(cfg.scheduler, optimiser)
+    # infer = lambda x: compressor(x, *logits2comp_params(params), delay=comp_delay)
 
     # initialize loss function
-    loss_fn = hydra.utils.instantiate(cfg.loss_fn)
+    # loss_fn = hydra.utils.instantiate(cfg.loss_fn).to(device)
+    loss_fn = partial(torch.nn.functional.mse_loss, reduction="sum")
 
-    prefilter = partial(
-        lfilter,
-        a_coeffs=torch.tensor(
-            [1, -0.995], dtype=torch.float32, device=train_input.device
-        ),
-        b_coeffs=torch.tensor([1, -1], dtype=torch.float32, device=train_input.device),
-        clamp=False,
+    prefilt = partial(
+        simple_filter,
+        a1=torch.tensor(-0.995, device=device),
+        b1=torch.tensor(-1, device=device),
     )
 
-    train_target = prefilter(train_target)
-    if test_input is not None:
-        test_target = prefilter(test_target)
+    unfold_input = train_input.unfold(1, frame_size, hop_size).reshape(-1, frame_size)
+    unfold_target = train_target.unfold(1, frame_size, hop_size).reshape(-1, frame_size)
+    unfold_target = prefilt(unfold_target)
 
-    # filtered_esr = lambda x, y: esr(prefilter(x), prefilter(y))
+    def get_param2loss(x, y):
+        return chain_functions(
+            logits2comp_params,
+            lambda d: compressor(x, **d, delay=comp_delay),
+            prefilt,
+            lambda x: loss_fn(
+                x[:, frame_size - hop_size :], y[:, frame_size - hop_size :]
+            ),
+        )
 
-    def dump_params(loss=None):
-        # convert params to dict for yaml
-        out = {k: v.item() for k, v in params.items()}
+    param2loss = get_param2loss(unfold_input, unfold_target)
+    # grad = torch.func.grad(param2loss)
+    # hess = torch.func.hessian(param2loss)
 
-        formated = {
-            "attack_ms": c2m(param_at()).item(),
-            "ratio": param_ratio().item(),
-            "rms_avg": param_rms_avg().item(),
-            "rms_avg_ms": c2m(param_rms_avg()).item(),
-        }
-        if not cfg.compressor.simple:
-            formated["release_ms"] = c2m(param_rt()).item()
+    # loader = DataLoader(
+    #     TensorDataset(unfold_input, unfold_target), batch_size=batch_size, shuffle=True
+    # )
 
-        out["formated_params"] = formated
-        if loss is not None:
-            out["loss"] = loss
-        return out
+    # h_inv = torch.eye(params.shape[0], device=device)
+    # h_avg = torch.eye(params.shape[0], device=device)
+    # g_avg = params.new_zeros(params.shape)
 
-    final_params = dump_params()
+    reg_lambda = cfg.optimiser.reg_lambda
+    alpha = cfg.optimiser.alpha
+    beta = cfg.optimiser.beta
+    max_iter = cfg.optimiser.max_iter
+
+    prev_loss = param2loss(params)
 
     with tqdm(range(cfg.epochs)) as pbar:
+        for global_step in pbar:
+            g = sum(
+                map(
+                    lambda f: f(params),
+                    map(
+                        torch.func.grad,
+                        map(
+                            get_param2loss,
+                            unfold_input.split(batch_size),
+                            unfold_target.split(batch_size),
+                        ),
+                    ),
+                )
+            )
+            hess = sum(
+                map(
+                    lambda f: f(params),
+                    map(
+                        torch.func.hessian,
+                        map(
+                            get_param2loss,
+                            unfold_input.split(batch_size),
+                            unfold_target.split(batch_size),
+                        ),
+                    ),
+                ),
+            )
 
-        def step(lowest_loss: torch.Tensor, global_step: int):
-            optimiser.zero_grad()
-            pred = infer(train_input)
+            h_inv = torch.linalg.inv(hess.diagonal_scatter(hess.diag() + reg_lambda))
+            # h_inv = torch.diag(1 / (hess.diag() + reg_lambda))
+            step = -h_inv @ g
+            lambda_norm = -g @ step
 
-            if torch.isnan(pred).any():
-                raise ValueError("NaN in prediction")
+            # perform backtracking line search
+            t = 1
+            i = 0
+            upper_bound = prev_loss + alpha * t * lambda_norm
+            for i in range(max_iter):
+                params_new = params + t * step
+                loss = param2loss(params_new)
+                if loss < upper_bound:
+                    break
+                t *= beta
+            if i == max_iter - 1:
+                print("Line search failed")
+                print(f"Loss: {loss}, Upper bound: {upper_bound}, norm: {lambda_norm}")
+                break
 
-            if torch.isinf(pred).any():
-                raise ValueError("Inf in prediction")
-
-            pred = prefilter(pred)
-
-            loss = loss_fn(pred, train_target)
-            with torch.no_grad():
-                esr_val = esr(pred, train_target).item()
-
-            if lowest_loss > loss:
-                lowest_loss = loss.item()
-                final_params.update(dump_params(lowest_loss))
-                final_params["esr"] = esr_val
-
-            loss.backward()
-            optimiser.step()
-            scheduler.step()
+            params = params_new
+            prev_loss = loss
 
             pbar_dict = {
-                "loss": loss.item(),
-                "lowest_loss": lowest_loss,
-                "avg_coef": param_rms_avg().item(),
-                "ratio": param_ratio().item(),
-                "th": param_th.item(),
-                "attack_ms": c2m(param_at()).item(),
-                "make_up": param_make_up_gain.item(),
-                "lr": optimiser.param_groups[0]["lr"],
-                "esr": esr_val,
+                "loss": loss,
+                "norm": lambda_norm,
+                "t": t,
+                "inner_iter": i,
+            } | logits2comp_params(params)
+
+            pbar_dict["at"] = coef2ms(pbar_dict["at"], sr=sr)
+            pbar_dict["rt"] = coef2ms(pbar_dict["rt"], sr=sr)
+            pbar_dict = {
+                k: v.item() if isinstance(v, torch.Tensor) else v
+                for k, v in pbar_dict.items()
             }
-            if not cfg.compressor.simple:
-                pbar_dict["release_ms"] = c2m(param_rt()).item()
 
             pbar.set_postfix(**pbar_dict)
 
-            wandb.log(pbar_dict, step=global_step)
+            # wandb.log(pbar_dict, step=global_step)
 
-            return lowest_loss
+        #     return lowest_loss
 
-        try:
-            losses = list(accumulate(pbar, step, initial=torch.inf))
-        except KeyboardInterrupt:
-            print("Training interrupted")
-
-    if test_input is not None:
-        # load best model
-        params.load_state_dict(
-            {
-                k: torch.tensor(v)
-                for k, v in final_params.items()
-                if k != "formated_params"
-            },
-            strict=False,
-        )
-
-        pred = prefilter(infer(test_input))
-
-        test_loss = loss_fn(pred, test_target).item()
-
-        esr_val = esr(pred, test_target).item()
-        print(f"Test loss: {test_loss}")
-        print(f"Test ESR: {esr_val}")
-        wandb.log(
-            {
-                "test_loss": test_loss,
-                "test_esr": esr_val,
-            }
-        )
+        # try:
+        #     losses = list(accumulate(pbar, step, initial=torch.inf))
+        # except KeyboardInterrupt:
+        #     print("Training interrupted")
 
     print("Training complete. Saving model...")
-    if cfg.ckpt_path:
-        yaml.dump(final_params, open(cfg.ckpt_path, "w"), sort_keys=True)
-        wandb.log_artifact(cfg.ckpt_path, type="parameters")
-
-    summary = {
-        "loss": final_params["loss"],
-        "avg_coef": final_params["formated_params"]["rms_avg"],
-        "ratio": final_params["formated_params"]["ratio"],
-        "th": final_params["threshold"],
-        "attack_ms": final_params["formated_params"]["attack_ms"],
-        "make_up": final_params["make_up_gain"],
-        "esr": final_params["esr"],
-    }
-
-    run.summary.update(summary)
-
-    print("Final parameters:")
-    print(final_params)
 
     return
 
