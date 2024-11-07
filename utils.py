@@ -43,10 +43,10 @@ def avg_rms(audio: torch.Tensor, avg_coef: torch.Tensor) -> torch.Tensor:
     return avg(audio.square().clamp_min(1e-8), avg_coef).sqrt()
 
 
-def compressor(x, avg_coef, th, ratio, at, rt, make_up, delay: int = 0):
-    rms = avg_rms(x, avg_coef=avg_coef)
+def compressor(x, th, ratio, at, rt, make_up, delay: int = 0):
+    # rms = avg_rms(x, avg_coef=avg_coef)
     gain = comp_gain(
-        rms,
+        x.abs().clamp_min(1e-8),
         comp_ratio=ratio,
         comp_thresh=th,
         at=at,
@@ -57,16 +57,22 @@ def compressor(x, avg_coef, th, ratio, at, rt, make_up, delay: int = 0):
     return x * gain * db2amp(make_up.broadcast_to(x.shape[0], 1))
 
 
-def logits2comp_params(logits: torch.Tensor):
-    avg_coef_logits, th, ratio_logits, at_logits, rt_logits, make_up = torch.unbind(
-        logits, dim=0
-    )
-    avg_coef = torch.sigmoid(avg_coef_logits)
-    ratio = 1 + torch.exp(ratio_logits)
-    at = torch.sigmoid(at_logits)
-    rt = torch.sigmoid(rt_logits)
+def logits2comp_params(
+    logits: torch.Tensor,
+    ratio_func=lambda x: 1 + torch.exp(x),
+    at_func=torch.sigmoid,
+    rt_func=torch.sigmoid,
+):
+    th, ratio_logits, at_logits, rt_logits, make_up = torch.unbind(logits, dim=0)
+    # avg_coef = torch.sigmoid(avg_coef_logits)
+    # ratio = 1 + torch.exp(ratio_logits)
+    ratio = ratio_func(ratio_logits)
+    at = at_func(at_logits)
+    rt = rt_func(rt_logits)
+    # at = torch.sigmoid(at_logits)
+    # rt = torch.sigmoid(rt_logits)
     return {
-        "avg_coef": avg_coef,
+        # "avg_coef": avg_coef,
         "th": th,
         "ratio": ratio,
         "at": at,
