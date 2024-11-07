@@ -3,9 +3,8 @@ import logging
 nb_logger = logging.getLogger("numba")
 nb_logger.setLevel(logging.ERROR)  # only show error
 import torch
-from torch.nn import ParameterDict, Parameter
-from torch.utils.data import DataLoader, TensorDataset
 import wandb
+from pathlib import Path
 from tqdm import tqdm
 import hydra
 from omegaconf import OmegaConf, DictConfig
@@ -15,17 +14,14 @@ from typing import Any, Dict, List, Tuple
 import yaml
 from torchaudio import load
 from torchaudio.functional import lfilter
-from torchcomp import ms2coef, coef2ms, db2amp
+from torchcomp import ms2coef, coef2ms, db2amp, amp2db
 from torchlpc import sample_wise_lpc
 import pyloudnorm as pyln
 
 from utils import (
     arcsigmoid,
     compressor,
-    simple_compressor,
-    freq_simple_compressor,
     esr,
-    SPSACompressor,
     chain_functions,
     logits2comp_params,
 )
@@ -58,7 +54,8 @@ def train(cfg: DictConfig):
     assert train_input.shape == train_target.shape, "Input and target shapes must match"
 
     frame_size = int(sr * duration)
-    hop_size = frame_size - int(sr * overlap)
+    overlap = int(sr * overlap)
+    hop_size = frame_size - overlap
 
     meter = pyln.Meter(sr)
     loudness = meter.integrated_loudness(train_input.numpy().T)
@@ -69,44 +66,75 @@ def train(cfg: DictConfig):
     m2c = partial(ms2coef, sr=sr)
     c2m = partial(coef2ms, sr=sr)
 
-    # config: Any = OmegaConf.to_container(cfg)
+    config: Any = OmegaConf.to_container(cfg)
     # wandb_init = config.pop("wandb_init", {})
     # run: Any = wandb.init(config=config, **wandb_init)
 
     # initialize model
-    inits = cfg.compressor.inits
-    init_th = torch.tensor(inits.threshold, dtype=torch.float32)
-    init_ratio = torch.tensor(inits.ratio, dtype=torch.float32)
-    init_at = m2c(torch.tensor(inits.attack_ms, dtype=torch.float32))
-    init_rt = m2c(torch.tensor(inits.release_ms, dtype=torch.float32))
-    init_rms_avg = torch.tensor(inits.rms_avg, dtype=torch.float32)
-    init_make_up_gain = torch.tensor(inits.make_up_gain, dtype=torch.float32)
 
-    th = init_th
-    ratio_logit = torch.log(init_ratio - 1)
-    at_logit = arcsigmoid(init_at)
-    rt_logit = arcsigmoid(init_rt)
-    rms_avg_logit = arcsigmoid(init_rms_avg)
-    make_up_gain = init_make_up_gain
+    if cfg.compressor.range.ratio:
+        ratio_min, ratio_max = (
+            cfg.compressor.range.ratio.min,
+            cfg.compressor.range.ratio.max,
+        )
+        ratio_func = lambda x: ratio_min + (ratio_max - ratio_min) * torch.sigmoid(x)
+        ratio_func_inv = lambda x: torch.log((x - ratio_min) / (ratio_max - x))
+    else:
+        ratio_func = lambda x: 1 + torch.exp(x)
+        ratio_func_inv = lambda x: torch.log(x - 1)
 
-    params = torch.stack(
-        [rms_avg_logit, th, ratio_logit, at_logit, rt_logit, make_up_gain]
-    ).to(device)
+    if cfg.compressor.range.attack_ms:
+        at_min, at_max = (
+            m2c(torch.tensor(cfg.compressor.range.attack_ms.min, dtype=torch.float32)),
+            m2c(torch.tensor(cfg.compressor.range.attack_ms.max, dtype=torch.float32)),
+        )
+        at_func = lambda x: at_min + (at_max - at_min) * torch.sigmoid(x)
+        at_func_inv = lambda x: torch.log((x - at_min) / (at_max - x))
+    else:
+        at_func = torch.sigmoid
+        at_func_inv = arcsigmoid
+    if cfg.compressor.range.release_ms:
+        rt_min, rt_max = (
+            m2c(torch.tensor(cfg.compressor.range.release_ms.min, dtype=torch.float32)),
+            m2c(torch.tensor(cfg.compressor.range.release_ms.max, dtype=torch.float32)),
+        )
+        rt_func = lambda x: rt_min + (rt_max - rt_min) * torch.sigmoid(x)
+        rt_func_inv = lambda x: torch.log((x - rt_min) / (rt_max - x))
+    else:
+        rt_func = torch.sigmoid
+        rt_func_inv = arcsigmoid
+
+    my_logits2comp_params = partial(
+        logits2comp_params,
+        ratio_func=ratio_func,
+        at_func=at_func,
+        rt_func=rt_func,
+    )
+
+    if cfg.compressor.init_ckpt:
+        params = torch.load(cfg.compressor.init_ckpt, map_location=device)
+    else:
+        inits = cfg.compressor.inits
+        init_th = torch.tensor(inits.threshold, dtype=torch.float32)
+        init_ratio = torch.tensor(inits.ratio, dtype=torch.float32)
+        init_at = m2c(torch.tensor(inits.attack_ms, dtype=torch.float32))
+        init_rt = m2c(torch.tensor(inits.release_ms, dtype=torch.float32))
+        init_make_up_gain = torch.tensor(inits.make_up_gain, dtype=torch.float32)
+
+        th = init_th
+        make_up_gain = init_make_up_gain
+        ratio_logit = ratio_func_inv(init_ratio)
+        at_logit = at_func_inv(init_at)
+        rt_logit = rt_func_inv(init_rt)
+
+        params = torch.stack([th, ratio_logit, at_logit, rt_logit, make_up_gain]).to(
+            device
+        )
 
     train_input = train_input.to(device)
     train_target = train_target.to(device)
 
-    if cfg.compressor.init_config:
-        init_cfg = yaml.safe_load(open(cfg.compressor.init_config))
-        init_cfg.pop("formated_params", None)
-        init_params = {k: Parameter(torch.tensor(v)) for k, v in init_cfg.items()}
-        params.load_state_dict(init_params, strict=False)
-
     comp_delay = cfg.compressor.delay
-    # infer = lambda x: compressor(x, *logits2comp_params(params), delay=comp_delay)
-
-    # initialize loss function
-    # loss_fn = hydra.utils.instantiate(cfg.loss_fn).to(device)
     loss_fn = partial(torch.nn.functional.mse_loss, reduction="sum")
 
     prefilt = partial(
@@ -119,27 +147,34 @@ def train(cfg: DictConfig):
     unfold_target = train_target.unfold(1, frame_size, hop_size).reshape(-1, frame_size)
     unfold_target = prefilt(unfold_target)
 
+    def predict(x, params):
+        return prefilt(compressor(x, **my_logits2comp_params(params), delay=comp_delay))
+
     def get_param2loss(x, y):
         return chain_functions(
-            logits2comp_params,
-            lambda d: compressor(x, **d, delay=comp_delay),
-            prefilt,
-            lambda x: loss_fn(
-                x[:, frame_size - hop_size :], y[:, frame_size - hop_size :]
-            ),
+            # logits2comp_params,
+            # lambda d: compressor(x, **d, delay=comp_delay),
+            # prefilt,
+            partial(predict, x),
+            lambda x: loss_fn(x[:, overlap:], y[:, overlap:]),
         )
 
     param2loss = get_param2loss(unfold_input, unfold_target)
-    # grad = torch.func.grad(param2loss)
-    # hess = torch.func.hessian(param2loss)
 
-    # loader = DataLoader(
-    #     TensorDataset(unfold_input, unfold_target), batch_size=batch_size, shuffle=True
-    # )
-
-    # h_inv = torch.eye(params.shape[0], device=device)
-    # h_avg = torch.eye(params.shape[0], device=device)
-    # g_avg = params.new_zeros(params.shape)
+    # scale output gain to match target loudness
+    init_preds = predict(unfold_input, params)
+    scaler = amp2db(
+        torch.sqrt(
+            unfold_target[:, overlap:].square().mean()
+            / init_preds[:, overlap:].square().mean()
+        )
+    )
+    params[-1] += scaler
+    print(
+        f"Increasing make-up gain by {scaler.item()} dB"
+        if scaler > 0
+        else f"Decreasing make-up gain by {scaler.item()} dB"
+    )
 
     reg_lambda = cfg.optimiser.reg_lambda
     alpha = cfg.optimiser.alpha
@@ -147,6 +182,10 @@ def train(cfg: DictConfig):
     max_iter = cfg.optimiser.max_iter
 
     prev_loss = param2loss(params)
+    optimal_params = params.clone()
+    lowest_loss = prev_loss
+    t = 1
+    i = 0
 
     with tqdm(range(cfg.epochs)) as pbar:
         for global_step in pbar:
@@ -157,8 +196,8 @@ def train(cfg: DictConfig):
                         torch.func.grad,
                         map(
                             get_param2loss,
-                            unfold_input.split(batch_size),
-                            unfold_target.split(batch_size),
+                            unfold_input.split(batch_size * params.numel()),
+                            unfold_target.split(batch_size * params.numel()),
                         ),
                     ),
                 )
@@ -176,36 +215,72 @@ def train(cfg: DictConfig):
                     ),
                 ),
             )
-
-            h_inv = torch.linalg.inv(hess.diagonal_scatter(hess.diag() + reg_lambda))
+            try:
+                h_inv = torch.linalg.inv(
+                    hess.diagonal_scatter(hess.diag() + reg_lambda)
+                )
+            except RuntimeError:
+                print("Singular matrix detected, using pseudo-inverse")
+                h_inv = torch.linalg.pinv(
+                    hess.diagonal_scatter(hess.diag() + reg_lambda)
+                )
             # h_inv = torch.diag(1 / (hess.diag() + reg_lambda))
             step = -h_inv @ g
             lambda_norm = -g @ step
-
-            # perform backtracking line search
-            t = 1
-            i = 0
-            upper_bound = prev_loss + alpha * t * lambda_norm
-            for i in range(max_iter):
-                params_new = params + t * step
+            if lambda_norm < 0:
+                print(f"Negative curvature detected, {lambda_norm}")
+                # print(g, h_inv, step)
+                # step = -g / g.norm()
+                random_step = torch.randn_like(step) / step.numel() ** 0.5
+                ortho_step = random_step - random_step @ step / step.norm()
+                step = ortho_step
+                # step /= step.norm()
+                # lambda_norm = -g @ step
+                # break
+                params_new = params + step
                 loss = param2loss(params_new)
-                if loss < upper_bound:
+            else:
+
+                # perform backtracking line search
+                t = 1
+                i = 0
+                upper_bound = prev_loss + alpha * t * lambda_norm.relu()
+                for i in range(max_iter):
+                    params_new = params + t * step
+                    loss = param2loss(params_new)
+                    if loss < upper_bound:
+                        break
+                    t *= beta
+
+                if i == max_iter - 1:
+                    print("Line search failed")
+                    print(
+                        f"Loss: {loss}, Upper bound: {upper_bound}, norm: {lambda_norm}"
+                    )
                     break
-                t *= beta
-            if i == max_iter - 1:
-                print("Line search failed")
-                print(f"Loss: {loss}, Upper bound: {upper_bound}, norm: {lambda_norm}")
-                break
 
             params = params_new
+            if loss < lowest_loss:
+                optimal_params.copy_(params)
+                lowest_loss = loss
             prev_loss = loss
+
+            esr_score = esr(
+                prefilt(
+                    compressor(
+                        unfold_input, **my_logits2comp_params(params), delay=comp_delay
+                    )
+                )[:, overlap:],
+                unfold_target[:, overlap:],
+            )
 
             pbar_dict = {
                 "loss": loss,
                 "norm": lambda_norm,
                 "t": t,
                 "inner_iter": i,
-            } | logits2comp_params(params)
+                "esr": esr_score * 100,
+            } | my_logits2comp_params(params)
 
             pbar_dict["at"] = coef2ms(pbar_dict["at"], sr=sr)
             pbar_dict["rt"] = coef2ms(pbar_dict["rt"], sr=sr)
@@ -225,7 +300,15 @@ def train(cfg: DictConfig):
         # except KeyboardInterrupt:
         #     print("Training interrupted")
 
+    print(f"Lowest loss: {lowest_loss}")
     print("Training complete. Saving model...")
+
+    ckpt_dir = Path(cfg.ckpt_dir)
+    ckpt_dir.mkdir(parents=False, exist_ok=True)
+
+    torch.save(optimal_params, ckpt_dir / "logits.pt")
+    with open(ckpt_dir / "config.yaml", "w") as f:
+        yaml.dump(config, f)
 
     return
 
