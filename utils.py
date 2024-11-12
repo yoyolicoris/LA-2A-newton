@@ -43,7 +43,7 @@ def avg_rms(audio: torch.Tensor, avg_coef: torch.Tensor) -> torch.Tensor:
     return avg(audio.square().clamp_min(1e-8), avg_coef).sqrt()
 
 
-def compressor(x, th, ratio, at, rt, make_up, delay: int = 0):
+def gain_reduction(x, th, ratio, at, rt, make_up, delay: int = 0):
     # rms = avg_rms(x, avg_coef=avg_coef)
     gain = comp_gain(
         x.abs().clamp_min(1e-8),
@@ -54,7 +54,15 @@ def compressor(x, th, ratio, at, rt, make_up, delay: int = 0):
     )
     if delay > 0:
         gain = torch.cat([gain[:, delay:], gain.new_ones(gain.shape[0], delay)], dim=1)
-    return x * gain * db2amp(make_up.broadcast_to(x.shape[0], 1))
+    return gain * db2amp(make_up.broadcast_to(x.shape[0], 1))
+
+
+def compressor(x, *args, **kwargs):
+    return gain_reduction(x, *args, **kwargs) * x
+
+
+def compressor_inverse_filter(y, *args, **kwargs):
+    return y / gain_reduction(*args, **kwargs)
 
 
 def logits2comp_params(

@@ -21,6 +21,7 @@ import pyloudnorm as pyln
 from utils import (
     arcsigmoid,
     compressor,
+    compressor_inverse_filter,
     esr,
     chain_functions,
     logits2comp_params,
@@ -143,21 +144,40 @@ def train(cfg: DictConfig):
         b1=torch.tensor(-1, device=device),
     )
 
+    mode = cfg.mode
+
     unfold_input = train_input.unfold(1, frame_size, hop_size).reshape(-1, frame_size)
     unfold_target = train_target.unfold(1, frame_size, hop_size).reshape(-1, frame_size)
-    unfold_target = prefilt(unfold_target)
 
     def predict(x, params):
         return prefilt(compressor(x, **my_logits2comp_params(params), delay=comp_delay))
 
-    def get_param2loss(x, y):
-        return chain_functions(
-            # logits2comp_params,
-            # lambda d: compressor(x, **d, delay=comp_delay),
-            # prefilt,
-            partial(predict, x),
-            lambda x: loss_fn(x[:, overlap:], y[:, overlap:]),
-        )
+    match mode:
+        case "forward":
+            unfold_target = prefilt(unfold_target)
+
+            def get_param2loss(x, y):
+                return chain_functions(
+                    # logits2comp_params,
+                    # lambda d: compressor(x, **d, delay=comp_delay),
+                    # prefilt,
+                    partial(predict, x),
+                    lambda pred: loss_fn(pred[:, overlap:], y[:, overlap:]),
+                )
+
+        case "inverse":
+            unfold_input = prefilt(unfold_input)
+
+            def get_param2loss(x, y):
+                return chain_functions(
+                    logits2comp_params,
+                    lambda d: compressor_inverse_filter(y, x, **d, delay=comp_delay),
+                    prefilt,
+                    lambda inv_y: loss_fn(x[:, overlap:], inv_y[:, overlap:]),
+                )
+
+        case _:
+            raise ValueError(f"Invalid mode: {mode}")
 
     param2loss = get_param2loss(unfold_input, unfold_target)
 
@@ -189,43 +209,76 @@ def train(cfg: DictConfig):
 
     with tqdm(range(cfg.epochs)) as pbar:
         for global_step in pbar:
-            g = sum(
-                map(
-                    lambda f: f(params),
-                    map(
-                        torch.func.grad,
-                        map(
-                            get_param2loss,
-                            unfold_input.split(batch_size * params.numel()),
-                            unfold_target.split(batch_size * params.numel()),
-                        ),
-                    ),
-                )
-            )
+            # grad_func = lambda p: sum(
+            #     map(
+            #         lambda f: f(p),
+            #         map(
+            #             torch.func.grad,
+            #             map(
+            #                 get_param2loss,
+            #                 unfold_input.split(batch_size * params.numel()),
+            #                 unfold_target.split(batch_size * params.numel()),
+            #             ),
+            #         ),
+            #     )
+            # )
+            # g = grad_func(params)
+            g = torch.autograd.functional.jacobian(param2loss, params)
+
             hess = sum(
                 map(
-                    lambda f: f(params),
+                    lambda f: torch.autograd.functional.hessian(
+                        f,
+                        params,
+                        # vectorize=True,
+                        # outer_jacobian_strategy="forward-mode",
+                    ),
                     map(
-                        torch.func.hessian,
-                        map(
-                            get_param2loss,
-                            unfold_input.split(batch_size),
-                            unfold_target.split(batch_size),
-                        ),
+                        get_param2loss,
+                        unfold_input.split(batch_size),
+                        unfold_target.split(batch_size),
                     ),
                 ),
             )
+
+            # hess = torch.autograd.functional.hessian(
+            #     param2loss,
+            #     params,
+            #     # vectorize=True,
+            #     # outer_jacobian_strategy="forward-mode",
+            # )
             try:
-                h_inv = torch.linalg.inv(
-                    hess.diagonal_scatter(hess.diag() + reg_lambda)
-                )
+                # h_inv = torch.linalg.inv(
+                #     hess.diagonal_scatter(hess.diag() + reg_lambda)
+                # )
+                step = -torch.linalg.solve(hess, g)
+                # r_t = -g
+                # p_t = g
+                # v_t = torch.zeros_like(g)
+                # while torch.norm(r_t) > torch.finfo(r_t.dtype).eps:
+                # loss, Ap_t_transpose = torch.autograd.functional.vhp(
+                #     param2loss, params, p_t
+                # )
+                # Ap_t = Ap_t_transpose.t()
+                # loss, Ap_t = torch.autograd.functional.hvp(param2loss, params, p_t)
+                # Ap_t = torch.func.jvp(grad_func, (params,), (p_t,))[1]
+                # Ap_t = torch.func.grad(lambda y: grad_func(y) @ p_t)(params)
+                # Ap_t = torch.func.vjp(torch.func.grad(param2loss), params)[1](p_t)
+                # alpha_t = (r_t @ r_t) / (p_t @ Ap_t)
+                # v_t += alpha_t * p_t
+                # r_new = r_t + alpha_t * Ap_t
+                # beta_t = (r_new @ r_new) / (r_t @ r_t)
+                # p_t = -r_new + beta_t * p_t
+                # r_t = r_new
+                # print(f"Loss: {loss}, norm: {r_t.norm()}")
+                # step = -v_t
             except RuntimeError:
                 print("Singular matrix detected, using pseudo-inverse")
                 h_inv = torch.linalg.pinv(
                     hess.diagonal_scatter(hess.diag() + reg_lambda)
                 )
-            # h_inv = torch.diag(1 / (hess.diag() + reg_lambda))
-            step = -h_inv @ g
+                h_inv = torch.diag(1 / (hess.diag() + reg_lambda))
+                step = -h_inv @ g
             lambda_norm = -g @ step
             if lambda_norm < 0:
                 print(f"Negative curvature detected, {lambda_norm}")
