@@ -274,11 +274,12 @@ def train(cfg: DictConfig):
                 # step = -v_t
             except RuntimeError:
                 print("Singular matrix detected, using pseudo-inverse")
-                h_inv = torch.linalg.pinv(
-                    hess.diagonal_scatter(hess.diag() + reg_lambda)
-                )
-                h_inv = torch.diag(1 / (hess.diag() + reg_lambda))
-                step = -h_inv @ g
+                # h_inv = torch.linalg.pinv(
+                #     hess.diagonal_scatter(hess.diag() + reg_lambda)
+                # )
+                # h_inv = torch.diag(1 / (hess.diag() + reg_lambda))
+                # step = -h_inv @ g
+                step = -torch.linalg.lstsq(hess, g).solution
             lambda_norm = -g @ step
             if lambda_norm < 0:
                 print(f"Negative curvature detected, {lambda_norm}")
