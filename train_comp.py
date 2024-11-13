@@ -9,11 +9,9 @@ from tqdm import tqdm
 import hydra
 from omegaconf import OmegaConf, DictConfig
 from functools import partial, reduce
-from itertools import chain, starmap, accumulate
 from typing import Any, Dict, List, Tuple
 import yaml
 from torchaudio import load
-from torchaudio.functional import lfilter
 from torchcomp import ms2coef, coef2ms, db2amp, amp2db
 from torchlpc import sample_wise_lpc
 import pyloudnorm as pyln
@@ -26,6 +24,31 @@ from utils import (
     chain_functions,
     logits2comp_params,
 )
+
+
+def direct_hess_step(hess_func, g):
+    hess = hess_func()
+    try:
+        step = -torch.linalg.solve(hess, g)
+    except RuntimeError:
+        print("Singular matrix detected, using lstsq")
+        step = -torch.linalg.lstsq(hess, g).solution
+    return step
+
+
+def conjugate_gradient(p, func, g):
+    r_t = -g
+    p_t = g
+    v_t = torch.zeros_like(g)
+    while torch.norm(r_t) > torch.finfo(r_t.dtype).eps:
+        _, Ap_t = torch.autograd.functional.vhp(func, p, p_t)
+        alpha_t = (r_t @ r_t) / (p_t @ Ap_t)
+        v_t += alpha_t * p_t
+        r_new = r_t + alpha_t * Ap_t
+        beta_t = (r_new @ r_new) / (r_t @ r_t)
+        p_t = -r_new + beta_t * p_t
+        r_t = r_new
+    return -v_t
 
 
 def simple_filter(x: torch.Tensor, a1: torch.Tensor, b1: torch.Tensor) -> torch.Tensor:
@@ -145,6 +168,7 @@ def train(cfg: DictConfig):
     )
 
     mode = cfg.mode
+    method = cfg.optimiser.method
 
     unfold_input = train_input.unfold(1, frame_size, hop_size).reshape(-1, frame_size)
     unfold_target = train_target.unfold(1, frame_size, hop_size).reshape(-1, frame_size)
@@ -196,7 +220,6 @@ def train(cfg: DictConfig):
         else f"Decreasing make-up gain by {scaler.item()} dB"
     )
 
-    reg_lambda = cfg.optimiser.reg_lambda
     alpha = cfg.optimiser.alpha
     beta = cfg.optimiser.beta
     max_iter = cfg.optimiser.max_iter
@@ -225,61 +248,30 @@ def train(cfg: DictConfig):
             # g = grad_func(params)
             g = torch.autograd.functional.jacobian(param2loss, params)
 
-            hess = sum(
-                map(
-                    lambda f: torch.autograd.functional.hessian(
-                        f,
-                        params,
-                        # vectorize=True,
-                        # outer_jacobian_strategy="forward-mode",
-                    ),
+            if batch_size > 1:
+                hess_func = lambda: sum(
                     map(
-                        get_param2loss,
-                        unfold_input.split(batch_size),
-                        unfold_target.split(batch_size),
+                        partial(torch.autograd.functional.hessian, inputs=params),
+                        map(
+                            get_param2loss,
+                            unfold_input.split(batch_size),
+                            unfold_target.split(batch_size),
+                        ),
                     ),
-                ),
-            )
+                )
+            else:
+                hess_func = lambda: torch.autograd.functional.hessian(
+                    param2loss, params
+                )
 
-            # hess = torch.autograd.functional.hessian(
-            #     param2loss,
-            #     params,
-            #     # vectorize=True,
-            #     # outer_jacobian_strategy="forward-mode",
-            # )
-            try:
-                # h_inv = torch.linalg.inv(
-                #     hess.diagonal_scatter(hess.diag() + reg_lambda)
-                # )
-                step = -torch.linalg.solve(hess, g)
-                # r_t = -g
-                # p_t = g
-                # v_t = torch.zeros_like(g)
-                # while torch.norm(r_t) > torch.finfo(r_t.dtype).eps:
-                # loss, Ap_t_transpose = torch.autograd.functional.vhp(
-                #     param2loss, params, p_t
-                # )
-                # Ap_t = Ap_t_transpose.t()
-                # loss, Ap_t = torch.autograd.functional.hvp(param2loss, params, p_t)
-                # Ap_t = torch.func.jvp(grad_func, (params,), (p_t,))[1]
-                # Ap_t = torch.func.grad(lambda y: grad_func(y) @ p_t)(params)
-                # Ap_t = torch.func.vjp(torch.func.grad(param2loss), params)[1](p_t)
-                # alpha_t = (r_t @ r_t) / (p_t @ Ap_t)
-                # v_t += alpha_t * p_t
-                # r_new = r_t + alpha_t * Ap_t
-                # beta_t = (r_new @ r_new) / (r_t @ r_t)
-                # p_t = -r_new + beta_t * p_t
-                # r_t = r_new
-                # print(f"Loss: {loss}, norm: {r_t.norm()}")
-                # step = -v_t
-            except RuntimeError:
-                print("Singular matrix detected, using pseudo-inverse")
-                # h_inv = torch.linalg.pinv(
-                #     hess.diagonal_scatter(hess.diag() + reg_lambda)
-                # )
-                # h_inv = torch.diag(1 / (hess.diag() + reg_lambda))
-                # step = -h_inv @ g
-                step = -torch.linalg.lstsq(hess, g).solution
+            match method:
+                case "direct":
+                    step = direct_hess_step(hess_func, g)
+                case "cg":
+                    step = conjugate_gradient(params, param2loss, g)
+                case _:
+                    raise ValueError(f"Invalid optimiser method: {method}")
+
             lambda_norm = -g @ step
             if lambda_norm < 0:
                 print(f"Negative curvature detected, {lambda_norm}")
