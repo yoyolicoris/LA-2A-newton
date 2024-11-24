@@ -1,6 +1,7 @@
 defaults:
   - data: la2a_100
 
+mode: forward
 epochs: 100
 ckpt_dir: /home/ycy/working/LA-2A-newton/fitted/la2a_100
 compressor:
@@ -24,7 +25,7 @@ compressor:
   delay: 0
 
 optimiser:
-  reg_lambda: 0.0000
+  method: direct
   alpha: 0.0001
   beta: 0.5
   max_iter: 20
