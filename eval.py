@@ -186,15 +186,27 @@ def main():
 
     with open(args.csv, "w") as f:
         f.write(
-            "Peak Reduction,Ground Truth,Linear Interpolation,Spline Interpolation\n"
+            "Peak Reduction,ESR,,,Threshold (dB),Ratio,Attack (ms),Release (ms), Make-up Gain (dB)\n"
         )
-        for peak, gt, linear, spline in zip(
-            peak_reductions, error_bounds, linear_esr_list, spline_esr_list
+        f.write(",GT,Linear Interpolation,Spline Interpolation\n")
+        for peak, gt, linear, spline, param in zip(
+            peak_reductions,
+            error_bounds,
+            linear_esr_list,
+            spline_esr_list,
+            map(convert2ms, params),
         ):
+            th = param["th"].item()
+            ratio = param["ratio"].item()
+            at = param["at"].item()
+            rt = param["rt"].item()
+            make_up = param["make_up"].item()
             if linear is None:
-                f.write(f"{peak},{gt},,\n")
+                f.write(f"{peak},{gt},,,{th},{ratio},{at},{rt},{make_up}\n")
             else:
-                f.write(f"{peak},{gt},{linear},{spline}\n")
+                f.write(
+                    f"{peak},{gt},{linear},{spline},{th},{ratio},{at},{rt},{make_up}\n"
+                )
 
 
 if __name__ == "__main__":
