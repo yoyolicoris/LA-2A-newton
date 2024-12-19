@@ -1,3 +1,5 @@
 outputs/
 *.pyc
 .vscode/
+fitted/
+limit_mode/
