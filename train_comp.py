@@ -335,7 +335,7 @@ def train(cfg: DictConfig):
                 for k, v in pbar_dict.items()
             }
 
-            pbar.set_postfix(**pbar_dict)
+            pbar.set_postfix(pbar_dict)
 
             # wandb.log(pbar_dict, step=global_step)
 
