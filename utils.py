@@ -5,6 +5,13 @@ from torch.autograd import Function
 from functools import reduce
 
 
+def simple_filter(x: torch.Tensor, a1: torch.Tensor, b1: torch.Tensor) -> torch.Tensor:
+    return sample_wise_lpc(
+        x + b1 * torch.cat([x.new_zeros(x.shape[0], 1), x[:, :-1]], dim=1),
+        a1.broadcast_to(x.shape + (1,)),
+    )
+
+
 def chain_functions(*functions):
     return lambda x: reduce(lambda x, f: f(x), functions, x)
 
@@ -66,10 +73,10 @@ def compressor_inverse_filter(y, *args, **kwargs):
 
 
 def logits2comp_params(
-    logits: torch.Tensor,
-    ratio_func=lambda x: 1 + torch.exp(x),
-    at_func=torch.sigmoid,
-    rt_func=torch.sigmoid,
+        logits: torch.Tensor,
+        ratio_func=lambda x: 1 + torch.exp(x),
+        at_func=torch.sigmoid,
+        rt_func=torch.sigmoid,
 ):
     th, ratio_logits, at_logits, rt_logits, make_up = torch.unbind(logits, dim=0)
     # avg_coef = torch.sigmoid(avg_coef_logits)
