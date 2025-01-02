@@ -1,9 +1,9 @@
 import logging
+import time
 
 nb_logger = logging.getLogger("numba")
 nb_logger.setLevel(logging.ERROR)  # only show error
 import torch
-import wandb
 from pathlib import Path
 from tqdm import tqdm
 import hydra
@@ -72,8 +72,8 @@ def train(cfg: DictConfig):
     train_target, sr2 = load(tr_cfg.target)
     assert sr == sr2, "Sample rates must match"
     if tr_cfg.start is not None and tr_cfg.end:
-        train_input = train_input[:, int(sr * tr_cfg.start) : int(sr * tr_cfg.end)]
-        train_target = train_target[:, int(sr * tr_cfg.start) : int(sr * tr_cfg.end)]
+        train_input = train_input[:, int(sr * tr_cfg.start): int(sr * tr_cfg.end)]
+        train_target = train_target[:, int(sr * tr_cfg.start): int(sr * tr_cfg.end)]
 
     assert train_input.shape == train_target.shape, "Input and target shapes must match"
 
@@ -91,8 +91,6 @@ def train(cfg: DictConfig):
     c2m = partial(coef2ms, sr=sr)
 
     config: Any = OmegaConf.to_container(cfg)
-    # wandb_init = config.pop("wandb_init", {})
-    # run: Any = wandb.init(config=config, **wandb_init)
 
     # initialize model
 
@@ -169,9 +167,13 @@ def train(cfg: DictConfig):
 
     mode = cfg.mode
     method = cfg.optimiser.method
+    hessian_module = cfg.optimiser.hessian_module
+    hessian_mode = cfg.optimiser.hessian_mode
 
     unfold_input = train_input.unfold(1, frame_size, hop_size).reshape(-1, frame_size)
     unfold_target = train_target.unfold(1, frame_size, hop_size).reshape(-1, frame_size)
+
+    print(f"Input shape: {unfold_input.shape}, Target shape: {unfold_target.shape}")
 
     def predict(x, params):
         return prefilt(compressor(x, **my_logits2comp_params(params), delay=comp_delay))
@@ -203,6 +205,25 @@ def train(cfg: DictConfig):
         case _:
             raise ValueError(f"Invalid mode: {mode}")
 
+    match hessian_module:
+        case "autograd":
+            base_hess_func = torch.autograd.functional.hessian
+        case "torchfunc":
+            match hessian_mode:
+                case "fwdrev":
+                    jac_chain = torch.func.hessian
+                case "revrev":
+                    jac_chain = chain_functions(torch.func.jacrev, torch.func.jacrev)
+                case "revfwd":
+                    jac_chain = chain_functions(torch.func.jacfwd, torch.func.jacrev)
+                case "fwdfwd":
+                    jac_chain = chain_functions(torch.func.jacfwd, torch.func.jacfwd)
+                case _:
+                    raise ValueError(f"Invalid hessian mode: {hessian_mode}")
+            base_hess_func = lambda func, inputs: jac_chain(func)(inputs)
+        case _:
+            raise ValueError(f"Invalid hessian module: {hessian_module}")
+
     param2loss = get_param2loss(unfold_input, unfold_target)
 
     # scale output gain to match target loudness
@@ -230,28 +251,17 @@ def train(cfg: DictConfig):
     t = 1
     i = 0
 
+    peak_mem_list = []
+    diff_mem_list = []
+    hess_time_list = []
     with tqdm(range(cfg.epochs)) as pbar:
         for global_step in pbar:
-            # grad_func = lambda p: sum(
-            #     map(
-            #         lambda f: f(p),
-            #         map(
-            #             torch.func.grad,
-            #             map(
-            #                 get_param2loss,
-            #                 unfold_input.split(batch_size * params.numel()),
-            #                 unfold_target.split(batch_size * params.numel()),
-            #             ),
-            #         ),
-            #     )
-            # )
-            # g = grad_func(params)
             g = torch.autograd.functional.jacobian(param2loss, params)
 
             if batch_size > 1:
                 hess_func = lambda: sum(
                     map(
-                        partial(torch.autograd.functional.hessian, inputs=params),
+                        partial(base_hess_func, inputs=params),
                         map(
                             get_param2loss,
                             unfold_input.split(batch_size),
@@ -260,10 +270,11 @@ def train(cfg: DictConfig):
                     ),
                 )
             else:
-                hess_func = lambda: torch.autograd.functional.hessian(
-                    param2loss, params
-                )
+                hess_func = lambda: base_hess_func(param2loss, params)
 
+            torch.cuda.reset_max_memory_allocated()
+            mem_before = torch.cuda.max_memory_allocated() / 1024 ** 2
+            t1 = time.time()
             match method:
                 case "direct":
                     step = direct_hess_step(hess_func, g)
@@ -271,6 +282,11 @@ def train(cfg: DictConfig):
                     step = conjugate_gradient(params, param2loss, g)
                 case _:
                     raise ValueError(f"Invalid optimiser method: {method}")
+            elapsed = time.time() - t1
+            hess_time_list.append(elapsed)
+            peak_memory = torch.cuda.max_memory_allocated() / 1024 ** 2
+            peak_mem_list.append(peak_memory)
+            diff_mem_list.append(peak_memory - mem_before)
 
             lambda_norm = -g @ step
             if lambda_norm < 0:
@@ -321,12 +337,13 @@ def train(cfg: DictConfig):
             )
 
             pbar_dict = {
-                "loss": loss,
-                "norm": lambda_norm,
-                "t": t,
-                "inner_iter": i,
-                "esr": esr_score * 100,
-            } | my_logits2comp_params(params)
+                            "loss": loss,
+                            "norm": lambda_norm,
+                            "t": t,
+                            "inner_iter": i,
+                            "esr": esr_score * 100,
+                            "peak_memory": peak_memory,
+                        } | my_logits2comp_params(params)
 
             pbar_dict["at"] = coef2ms(pbar_dict["at"], sr=sr)
             pbar_dict["rt"] = coef2ms(pbar_dict["rt"], sr=sr)
@@ -337,8 +354,6 @@ def train(cfg: DictConfig):
 
             pbar.set_postfix(pbar_dict)
 
-            # wandb.log(pbar_dict, step=global_step)
-
         #     return lowest_loss
 
         # try:
@@ -347,6 +362,9 @@ def train(cfg: DictConfig):
         #     print("Training interrupted")
 
     print(f"Lowest loss: {lowest_loss}")
+    print(f"Averaged peak memory: {sum(peak_mem_list) / len(peak_mem_list)} MB")
+    print(f"Averaged diff memory: {sum(diff_mem_list) / len(diff_mem_list)} MB")
+    print(f"Averaged hessian computation time: {sum(hess_time_list) / len(hess_time_list) / unfold_input.size(0)} s")
     print("Training complete. Saving model...")
 
     ckpt_dir = Path(cfg.ckpt_dir)
