@@ -16,6 +16,7 @@ HOP_LENGTH = SEQUENCE_LENGTH - OVERLAP_LENGTH
 BATCH_SIZE = 25
 LR = 5e-3
 EPOCHS = 50
+EARLY_STOPPING = 5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 source_dataset_path = Path(r"D:\Datasets\SignalTrain_LA2A_Aug\4A2A_no_makeup")
@@ -46,12 +47,12 @@ class SignalTrain4A2ADataset(torch.utils.data.Dataset):
     def __init__(self, path24a2a: Path, path2signaltrain: Path, name_pattern: str = ""):
         super().__init__()
 
-        all_input_files = list(
+        self.all_input_files = list(
             filter(lambda f: torchaudio.info(f).num_frames > 44100 * 600, path24a2a.glob(f"**/*{name_pattern}*.wav")))
-        all_target_files = [path2signaltrain / f.relative_to(path24a2a) for f in all_input_files]
+        all_target_files = [path2signaltrain / f.relative_to(path24a2a) for f in self.all_input_files]
 
         print("Loading files...")
-        all_inputs = [torchaudio.load(f)[0] for f in tqdm(all_input_files)]
+        all_inputs = [torchaudio.load(f)[0] for f in tqdm(self.all_input_files)]
         min_len = min(map(lambda x: x.size(-1), all_inputs))
         self.all_inputs = torch.stack([x[:, :min_len] for x in all_inputs], 0)
         self.all_targets = torch.empty_like(self.all_inputs)
@@ -85,29 +86,45 @@ class GRUAmp(nn.Module):
 
 
 if __name__ == "__main__":
-    ckpt_prefix = "gru_jit"
+    ckpt_prefix = "gru_jit_no_overlap"
     model = torch.jit.script(GRUAmp(8).to(DEVICE))
     optimiser = torch.optim.Adam(model.parameters(), lr=LR)
     print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
 
     train_dataset = SignalTrain4A2ADataset(source_dataset_path, target_dataset_path, "3c")
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=1,
-                                               pin_memory=True)
+    # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=1,
+    #                                            pin_memory=True)
+
+    all_inputs = train_dataset.all_inputs.transpose(1, 2)
+    all_targets = train_dataset.all_targets.squeeze(1)
+    random_shifts = (torch.linspace(0, 1, all_inputs.size(0) + 1, device=DEVICE)[:-1] * all_inputs.size(1)).long()
+
     prev_avg_loss = float("inf")
+    early_stopping_counter = 0
     for epoch in range(EPOCHS):
         n = 0
         avg_loss = 0
-        with tqdm(train_loader) as pbar:
+        random_shifts = random_shifts[torch.randperm(random_shifts.size(0))]
+        for i in range(0, all_inputs.size(0)):
+            all_inputs[i] = torch.roll(all_inputs[i], random_shifts[i].item(), 0)
+            all_targets[i] = torch.roll(all_targets[i], random_shifts[i].item(), 0)
+
+        # with tqdm(train_loader) as pbar:
+        with tqdm(list(zip(all_inputs.split(SEQUENCE_LENGTH, 1), all_targets.split(SEQUENCE_LENGTH, 1)))) as pbar:
+            state = None
             for x, y in pbar:
-                x, y = x.to(DEVICE).transpose(1, 2), y.to(DEVICE).squeeze(1)[:, OVERLAP_LENGTH:]
+                # x, y = x.to(DEVICE).transpose(1, 2), y.to(DEVICE).squeeze(1)[:, OVERLAP_LENGTH:]
+                x, y = x.to(DEVICE), y.to(DEVICE)
                 with torch.autocast(device_type="cuda"):
-                    pred, _ = model(x)
-                    pred = pred.squeeze(-1)[:, OVERLAP_LENGTH:]
+                    pred, state = model(x, state)
+                    # pred = pred.squeeze(-1)[:, OVERLAP_LENGTH:]
+                    pred = pred.squeeze(-1)
                     loss = esr_loss(pred, y)
                 optimiser.zero_grad()
                 loss.backward()
                 optimiser.step()
 
+                state = state.detach()
                 n += 1
                 avg_loss += (loss.item() - avg_loss) / n
                 pbar.set_description(f"Epoch {epoch}, Loss: {loss.item():.4f}, Avg Loss: {avg_loss:.4f}")
@@ -115,3 +132,9 @@ if __name__ == "__main__":
             if avg_loss < prev_avg_loss:
                 torch.jit.save(model, f"{ckpt_prefix}_{epoch}_{avg_loss:.4f}.pt")
                 prev_avg_loss = avg_loss
+                early_stopping_counter = 0
+            else:
+                early_stopping_counter += 1
+
+            if early_stopping_counter >= EARLY_STOPPING:
+                break
